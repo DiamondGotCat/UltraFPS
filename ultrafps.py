@@ -12,6 +12,7 @@ from cryptography.hazmat.backends import default_backend
 import getpass
 import secrets
 import subprocess
+from KamuJpModern import KamuJpModern  # KamuJpModern をインポート
 
 CHUNK_SIZE = 1024 * 1024 * 8  # 8MB
 COMPRESSION_LEVEL = 3
@@ -34,13 +35,14 @@ def derive_key(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode())
 
 class UltraFPS_Server:
-    def __init__(self, host, port, shared_dir, encrypt=False, compress=False, password=None):
+    def __init__(self, host, port, shared_dir, encrypt=False, compress=False, password=None, logger=None):
         self.host = host
         self.port = port
         self.shared_dir = os.path.abspath(shared_dir)
         self.encrypt = encrypt
         self.compress = compress
         self.password = password
+        self.logger = logger or KamuJpModern().modernLogging(process_name="Server")
         self.zstd_compressor = zstd.ZstdCompressor(level=COMPRESSION_LEVEL) if self.compress else None
         self.zstd_decompressor = zstd.ZstdDecompressor() if self.compress else None
         self.key = None
@@ -58,7 +60,7 @@ class UltraFPS_Server:
 
     async def handle_client(self, reader, writer):
         addr = writer.get_extra_info('peername')
-        print(f"[CONNECTED] {addr}")
+        self.logger.log(f"[CONNECTED] {addr}", "INFO")
         try:
             while True:
                 data = await reader.readline()
@@ -67,33 +69,33 @@ class UltraFPS_Server:
                 command_line = data.decode().strip()
                 if not command_line:
                     continue
-                print(f"[COMMAND] {command_line} from {addr}")
+                self.logger.log(f"[COMMAND] {command_line} from {addr}", "INFO")
                 parts = command_line.split()
                 command = parts[0].upper()
                 if command == 'UPLOAD':
-                    await self.handle_upload(reader, writer, parts[1:])
+                    await self.handle_upload(reader, writer, parts[1:], addr)
                 elif command == 'DOWNLOAD':
-                    await self.handle_download(reader, writer, parts[1:])
+                    await self.handle_download(reader, writer, parts[1:], addr)
                 elif command == 'LIST':
-                    await self.handle_list(writer, parts[1:])
+                    await self.handle_list(writer, parts[1:], addr)
                 elif command == 'MKDIR':
-                    await self.handle_mkdir(writer, parts[1:])
+                    await self.handle_mkdir(writer, parts[1:], addr)
                 elif command == 'EDIT':
-                    await self.handle_edit(writer, parts[1:])
+                    await self.handle_edit(writer, parts[1:], addr)
                 else:
                     await self.send_response(writer, f"ERR Unknown command: {command}\n")
         except Exception as e:
-            print(f"[ERROR] {e} from {addr}")
+            self.logger.log(f"[ERROR] {e} from {addr}", "ERROR")
         finally:
             writer.close()
             await writer.wait_closed()
-            print(f"[DISCONNECTED] {addr}")
+            self.logger.log(f"[DISCONNECTED] {addr}", "INFO")
 
     async def send_response(self, writer, message):
         writer.write(message.encode())
         await writer.drain()
 
-    async def handle_upload(self, reader, writer, args):
+    async def handle_upload(self, reader, writer, args, addr):
         if len(args) < 1:
             await self.send_response(writer, "ERR Missing file path for UPLOAD\n")
             return
@@ -104,32 +106,51 @@ class UltraFPS_Server:
             return
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         # 受信するファイルサイズ
-        size_data = await reader.readexactly(8)
-        file_size = int.from_bytes(size_data, 'big')
+        try:
+            size_data = await reader.readexactly(8)
+            file_size = int.from_bytes(size_data, 'big')
+        except asyncio.IncompleteReadError:
+            await self.send_response(writer, "ERR Failed to read file size\n")
+            return
+        # プログレスバーの設定
+        total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
+        progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="UPLOAD", process_color=34)
+        progress_bar.start()
+
         # 受信ファイルデータ
         received = 0
         with open(save_path, 'wb') as f:
             while received < file_size:
-                # チャンクサイズを受信
-                chunk_size_data = await reader.readexactly(8)
-                chunk_size = int.from_bytes(chunk_size_data, 'big')
-                # チャンクデータを受信
-                chunk = await reader.readexactly(chunk_size)
+                try:
+                    # チャンクサイズを受信
+                    chunk_size_data = await reader.readexactly(8)
+                    chunk_size = int.from_bytes(chunk_size_data, 'big')
+                    # チャンクデータを受信
+                    chunk = await reader.readexactly(chunk_size)
+                except asyncio.IncompleteReadError:
+                    await self.send_response(writer, "ERR Failed to read chunk data\n")
+                    progress_bar.finish()
+                    return
                 if self.encrypt:
                     chunk = self.decryptor.update(chunk)
                 if self.compress:
                     chunk = self.zstd_decompressor.decompress(chunk)
                 f.write(chunk)
                 received += chunk_size
+                progress_bar.update()
         if self.encrypt:
-            final_chunk = self.decryptor.finalize()
-            if final_chunk:
-                with open(save_path, 'ab') as f:
-                    f.write(final_chunk)
+            try:
+                final_chunk = self.decryptor.finalize()
+                if final_chunk:
+                    with open(save_path, 'ab') as f:
+                        f.write(final_chunk)
+            except Exception as e:
+                self.logger.log(f"[ERROR] Finalize decryption failed: {e}", "ERROR")
+        progress_bar.finish()
         await self.send_response(writer, "OK Upload successful\n")
-        print(f"[UPLOAD] {relative_path} from client")
+        self.logger.log(f"[UPLOAD] {relative_path} from {addr}", "INFO")
 
-    async def handle_download(self, reader, writer, args):
+    async def handle_download(self, reader, writer, args, addr):
         if len(args) < 1:
             await self.send_response(writer, "ERR Missing file path for DOWNLOAD\n")
             return
@@ -143,6 +164,11 @@ class UltraFPS_Server:
             return
         file_size = os.path.getsize(file_path)
         await self.send_response(writer, f"OK {file_size}\n")
+        # プログレスバーの設定
+        total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
+        progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="DOWNLOAD", process_color=34)
+        progress_bar.start()
+
         # 送信ファイルデータ
         with open(file_path, 'rb') as f:
             while True:
@@ -155,14 +181,19 @@ class UltraFPS_Server:
                     chunk = self.encryptor.update(chunk)
                 writer.write(len(chunk).to_bytes(8, 'big') + chunk)
                 await writer.drain()
+                progress_bar.update()
         if self.encrypt:
-            final_chunk = self.encryptor.finalize()
-            if final_chunk:
-                writer.write(len(final_chunk).to_bytes(8, 'big') + final_chunk)
-                await writer.drain()
-        print(f"[DOWNLOAD] {relative_path} to client")
+            try:
+                final_chunk = self.encryptor.finalize()
+                if final_chunk:
+                    writer.write(len(final_chunk).to_bytes(8, 'big') + final_chunk)
+                    await writer.drain()
+            except Exception as e:
+                self.logger.log(f"[ERROR] Finalize encryption failed: {e}", "ERROR")
+        progress_bar.finish()
+        self.logger.log(f"[DOWNLOAD] {relative_path} to {addr}", "INFO")
 
-    async def handle_list(self, writer, args):
+    async def handle_list(self, writer, args, addr):
         directory = args[0] if args else '.'
         list_path = os.path.abspath(os.path.join(self.shared_dir, directory))
         if not list_path.startswith(self.shared_dir):
@@ -176,9 +207,9 @@ class UltraFPS_Server:
         await self.send_response(writer, f"OK {len(response.encode())}\n")
         writer.write(response.encode())
         await writer.drain()
-        print(f"[LIST] {directory} to client")
+        self.logger.log(f"[LIST] {directory} to {addr}", "INFO")
 
-    async def handle_mkdir(self, writer, args):
+    async def handle_mkdir(self, writer, args, addr):
         if len(args) < 1:
             await self.send_response(writer, "ERR Missing directory path for MKDIR\n")
             return
@@ -189,9 +220,9 @@ class UltraFPS_Server:
             return
         os.makedirs(dir_path, exist_ok=True)
         await self.send_response(writer, "OK Directory created\n")
-        print(f"[MKDIR] {directory} by client")
+        self.logger.log(f"[MKDIR] {directory} by {addr}", "INFO")
 
-    async def handle_edit(self, writer, args):
+    async def handle_edit(self, writer, args, addr):
         if len(args) < 1:
             await self.send_response(writer, "ERR Missing file path for EDIT\n")
             return
@@ -205,23 +236,24 @@ class UltraFPS_Server:
             return
         await self.send_response(writer, "OK Opening editor\n")
         # EDIT機能はクライアント側で処理します
-        print(f"[EDIT] {relative_path} requested by client")
+        self.logger.log(f"[EDIT] {relative_path} requested by {addr}", "INFO")
         await self.send_response(writer, "ERR EDIT not implemented on server\n")
 
     async def start_server(self):
         server = await asyncio.start_server(self.handle_client, self.host, self.port)
         addrs = ', '.join(str(sock.getsockname()) for sock in server.sockets)
-        print(f"[SERVER] Listening on {addrs}")
+        self.logger.log(f"[SERVER] Listening on {addrs}", "INFO")
         async with server:
             await server.serve_forever()
 
 class UltraFPS_Client:
-    def __init__(self, host, port, encrypt=False, compress=False, password=None):
+    def __init__(self, host, port, encrypt=False, compress=False, password=None, logger=None):
         self.host = host
         self.port = port
         self.encrypt = encrypt
         self.compress = compress
         self.password = password
+        self.logger = logger or KamuJpModern().modernLogging(process_name="Client")
         self.zstd_compressor = zstd.ZstdCompressor(level=COMPRESSION_LEVEL) if self.compress else None
         self.zstd_decompressor = zstd.ZstdDecompressor() if self.compress else None
         self.key = None
@@ -246,94 +278,142 @@ class UltraFPS_Client:
             print(f"[ERR] Local file '{local_path}' does not exist.")
             return
         file_size = os.path.getsize(local_path)
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        await self.send_command(writer, f"UPLOAD {relative_path}")
-        # 送信ファイルサイズ
-        writer.write(file_size.to_bytes(8, 'big'))
-        await writer.drain()
-        # 送信ファイルデータ
-        with open(local_path, 'rb') as f:
-            while True:
-                chunk = f.read(CHUNK_SIZE)
-                if not chunk:
-                    break
-                if self.compress:
-                    chunk = self.zstd_compressor.compress(chunk)
-                if self.encrypt:
-                    chunk = self.encryptor.update(chunk)
-                writer.write(len(chunk).to_bytes(8, 'big') + chunk)
-                await writer.drain()
-        if self.encrypt:
-            final_chunk = self.encryptor.finalize()
-            if final_chunk:
-                writer.write(len(final_chunk).to_bytes(8, 'big') + final_chunk)
-                await writer.drain()
-        # サーバーからのレスポンス
-        response = await reader.readline()
-        print(response.decode().strip())
-        writer.close()
-        await writer.wait_closed()
+        try:
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            await self.send_command(writer, f"UPLOAD {relative_path}")
+            # 送信ファイルサイズ
+            writer.write(file_size.to_bytes(8, 'big'))
+            await writer.drain()
+            # プログレスバーの設定
+            total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
+            progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="UPLOAD", process_color=32)
+            progress_bar.start()
+
+            # 送信ファイルデータ
+            with open(local_path, 'rb') as f:
+                while True:
+                    chunk = f.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    if self.compress:
+                        chunk = self.zstd_compressor.compress(chunk)
+                    if self.encrypt:
+                        chunk = self.encryptor.update(chunk)
+                    writer.write(len(chunk).to_bytes(8, 'big') + chunk)
+                    await writer.drain()
+                    progress_bar.update()
+            if self.encrypt:
+                try:
+                    final_chunk = self.encryptor.finalize()
+                    if final_chunk:
+                        writer.write(len(final_chunk).to_bytes(8, 'big') + final_chunk)
+                        await writer.drain()
+                except Exception as e:
+                    self.logger.log(f"[ERROR] Finalize encryption failed: {e}", "ERROR")
+            progress_bar.finish()
+            # サーバーからのレスポンス
+            response = await reader.readline()
+            print(response.decode().strip())
+            self.logger.log(f"[UPLOAD] {relative_path} to server", "INFO")
+        except Exception as e:
+            self.logger.log(f"[ERROR] Upload failed: {e}", "ERROR")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def download(self, relative_path, local_path):
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        await self.send_command(writer, f"DOWNLOAD {relative_path}")
-        response = await reader.readline()
-        if response.startswith(b"OK"):
-            parts = response.decode().strip().split()
-            if len(parts) < 2:
-                print("[ERR] Invalid response from server.")
-                return
-            file_size = int(parts[1])
-            received = 0
-            with open(local_path, 'wb') as f:
-                while received < file_size:
-                    # 受信チャンクサイズ
-                    chunk_size_data = await reader.readexactly(8)
-                    chunk_size = int.from_bytes(chunk_size_data, 'big')
-                    # 受信チャンクデータ
-                    chunk = await reader.readexactly(chunk_size)
-                    if self.encrypt:
-                        chunk = self.decryptor.update(chunk)
-                    if self.compress:
-                        chunk = self.zstd_decompressor.decompress(chunk)
-                    f.write(chunk)
-                    received += chunk_size
-            if self.encrypt:
-                final_chunk = self.decryptor.finalize()
-                if final_chunk:
-                    with open(local_path, 'ab') as f:
-                        f.write(final_chunk)
-            print("[OK] Download successful.")
-        else:
-            print(response.decode().strip())
-        writer.close()
-        await writer.wait_closed()
+        try:
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            await self.send_command(writer, f"DOWNLOAD {relative_path}")
+            response = await reader.readline()
+            if response.startswith(b"OK"):
+                parts = response.decode().strip().split()
+                if len(parts) < 2:
+                    print("[ERR] Invalid response from server.")
+                    return
+                file_size = int(parts[1])
+                received = 0
+                # プログレスバーの設定
+                total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
+                progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="DOWNLOAD", process_color=32)
+                progress_bar.start()
+
+                with open(local_path, 'wb') as f:
+                    while received < file_size:
+                        try:
+                            # 受信チャンクサイズ
+                            chunk_size_data = await reader.readexactly(8)
+                            chunk_size = int.from_bytes(chunk_size_data, 'big')
+                            # 受信チャンクデータ
+                            chunk = await reader.readexactly(chunk_size)
+                        except asyncio.IncompleteReadError:
+                            print("[ERR] Failed to read chunk data.")
+                            progress_bar.finish()
+                            return
+                        if self.encrypt:
+                            chunk = self.decryptor.update(chunk)
+                        if self.compress:
+                            chunk = self.zstd_decompressor.decompress(chunk)
+                        f.write(chunk)
+                        received += chunk_size
+                        progress_bar.update()
+                if self.encrypt:
+                    try:
+                        final_chunk = self.decryptor.finalize()
+                        if final_chunk:
+                            with open(local_path, 'ab') as f:
+                                f.write(final_chunk)
+                    except Exception as e:
+                        self.logger.log(f"[ERROR] Finalize decryption failed: {e}", "ERROR")
+                progress_bar.finish()
+                print("[OK] Download successful.")
+                self.logger.log(f"[DOWNLOAD] {relative_path} from server", "INFO")
+            else:
+                print(response.decode().strip())
+        except Exception as e:
+            self.logger.log(f"[ERROR] Download failed: {e}", "ERROR")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def list_dir(self, directory='.'):
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        await self.send_command(writer, f"LIST {directory}")
-        response = await reader.readline()
-        if response.startswith(b"OK"):
-            parts = response.decode().strip().split()
-            if len(parts) < 2:
-                print("[ERR] Invalid response from server.")
-                return
-            list_size = int(parts[1])
-            listing = await reader.readexactly(list_size)
-            print("[LIST]")
-            print(listing.decode())
-        else:
-            print(response.decode().strip())
-        writer.close()
-        await writer.wait_closed()
+        try:
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            await self.send_command(writer, f"LIST {directory}")
+            response = await reader.readline()
+            if response.startswith(b"OK"):
+                parts = response.decode().strip().split()
+                if len(parts) < 2:
+                    print("[ERR] Invalid response from server.")
+                    return
+                list_size = int(parts[1])
+                listing = await reader.readexactly(list_size)
+                print("[LIST]")
+                print(listing.decode())
+                self.logger.log(f"[LIST] {directory} from server", "INFO")
+            else:
+                print(response.decode().strip())
+        except Exception as e:
+            self.logger.log(f"[ERROR] List directory failed: {e}", "ERROR")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def mkdir(self, directory):
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        await self.send_command(writer, f"MKDIR {directory}")
-        response = await reader.readline()
-        print(response.decode().strip())
-        writer.close()
-        await writer.wait_closed()
+        try:
+            reader, writer = await asyncio.open_connection(self.host, self.port)
+            await self.send_command(writer, f"MKDIR {directory}")
+            response = await reader.readline()
+            print(response.decode().strip())
+            if response.startswith(b"OK"):
+                self.logger.log(f"[MKDIR] {directory} on server", "INFO")
+            else:
+                self.logger.log(f"[MKDIR] {directory} failed: {response.decode().strip()}", "ERROR")
+        except Exception as e:
+            self.logger.log(f"[ERROR] Mkdir failed: {e}", "ERROR")
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
     async def edit(self, relative_path):
         # クライアント側でファイルをダウンロードし、エディタで編集後、再アップロードします
@@ -344,6 +424,7 @@ class UltraFPS_Client:
         await self.upload(relative_path, local_temp)
         os.remove(local_temp)
         print("[OK] Edited and uploaded the file.")
+        self.logger.log(f"[EDIT] {relative_path} on server", "INFO")
 
     async def interactive(self):
         print("Welcome to UltraFPS Client!")
@@ -373,6 +454,7 @@ class UltraFPS_Client:
                 break
             else:
                 print("Invalid command or arguments.")
+                print("Available commands: upload <remote_path> <local_path>, download <remote_path> <local_path>, list [directory], mkdir <directory>, edit <remote_path>, exit")
 
 async def main():
     parser = argparse.ArgumentParser(description="UltraFPS: Ultra Fast File Share Protocol Secure")
@@ -397,31 +479,23 @@ async def main():
 
     if args.mode == 'server':
         password = args.password
-        if args.password:
-            password = args.password
-        elif args.password is None:
-            # パスワードが指定されていない場合は暗号化を無効化
-            password = None
+        encrypt = bool(password)
         server = UltraFPS_Server(
             host=args.host,
             port=args.port,
             shared_dir=args.shared_dir,
-            encrypt=bool(password),
+            encrypt=encrypt,
             compress=args.compress,
             password=password
         )
         await server.start_server()
     elif args.mode == 'client':
         password = args.password
-        if args.password:
-            password = args.password
-        elif args.password is None:
-            # パスワードが指定されていない場合は暗号化を無効化
-            password = None
+        encrypt = bool(password)
         client = UltraFPS_Client(
             host=args.host,
             port=args.port,
-            encrypt=bool(password),
+            encrypt=encrypt,
             compress=args.compress,
             password=password
         )
