@@ -116,6 +116,7 @@ class UltraFPS_Server:
         total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
         progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="UPLOAD", process_color=34)
         progress_bar.start()
+        progress_bar.notbusy()
 
         # 受信ファイルデータ
         received = 0
@@ -339,6 +340,7 @@ class UltraFPS_Client:
                 total_chunks = file_size // CHUNK_SIZE + (1 if file_size % CHUNK_SIZE else 0)
                 progress_bar = KamuJpModern().modernProgressBar(total=total_chunks, process_name="DOWNLOAD", process_color=32)
                 progress_bar.start()
+                progress_bar.notbusy()
 
                 with open(local_path, 'wb') as f:
                     while received < file_size:
